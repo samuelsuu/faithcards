@@ -1,0 +1,484 @@
+openapi: 3.0.3
+info:
+  title: FaithCards API
+  version: 1.0.0
+  description: >-
+    Backend for FaithCards — a Christian Scripture meditation app. Up to 5
+    personalised scripture cards per day from a deterministic (no-AI)
+    recommendation engine using mood, need, personality type, history and
+    favourites. All data access is protected by Postgres Row Level Security:
+    a user can only read/write their own rows.
+
+
+    **Authentication.** Every request needs two headers:
+      - `apikey: <publishable-or-anon-key>`
+      - `Authorization: Bearer <user-access-token>`  (from Supabase Auth sign-in)
+
+
+    The publishable key alone only grants the `anon` role (public reads). User
+    data requires a signed-in user's access token.
+servers:
+  - url: https://kqstctmmbxajikdxonwz.supabase.co
+    description: Production (Supabase project kqstctmmbxajikdxonwz)
+
+security:
+  - apikey: []
+    bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Sign up, log in, refresh, logout (Supabase Auth / GoTrue)
+  - name: Engine
+    description: Recommendation & streak RPCs (the core logic)
+  - name: Edge Functions
+    description: Authenticated HTTP wrappers over the engine RPCs
+  - name: Content
+    description: Public scripture & lookup data (read-only)
+  - name: User Data
+    description: Per-user rows, owner-only via RLS
+
+paths:
+  # ------------------------------------------------------------------- Auth
+  /auth/v1/signup:
+    post:
+      tags: [Auth]
+      summary: Register a new user (email + password)
+      description: >-
+        Creates a user and (via DB trigger) a profile. If "Confirm email" is
+        enabled, no session is returned until the user confirms via the emailed
+        link. Only the `apikey` header is required here (no bearer token).
+      security:
+        - apikey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: "user@gmail.com" }
+                password: { type: string, minLength: 6, example: "Sterling123!" }
+                data:
+                  type: object
+                  description: Optional user metadata (e.g. full_name)
+                  example: { full_name: "Ada Lovelace" }
+      responses:
+        "200":
+          description: User created (with or without a session)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthSession" }
+        "400": { description: Invalid email / weak password / already registered }
+
+  /auth/v1/token:
+    post:
+      tags: [Auth]
+      summary: Log in (grant_type=password) or refresh (grant_type=refresh_token)
+      description: "Call with `?grant_type=password`. Returns access + refresh tokens."
+      security:
+        - apikey: []
+      parameters:
+        - in: query
+          name: grant_type
+          required: true
+          schema: { type: string, enum: [password, refresh_token] }
+          example: password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: Session with tokens
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthSession" }
+        "400": { description: Invalid credentials / email not confirmed }
+
+  /auth/v1/user:
+    get:
+      tags: [Auth]
+      summary: Get the currently authenticated user
+      responses:
+        "200": { description: User }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/v1/logout:
+    post:
+      tags: [Auth]
+      summary: Log out (revoke the current session)
+      responses:
+        "204": { description: Logged out }
+
+  /auth/v1/recover:
+    post:
+      tags: [Auth]
+      summary: Send a password-reset email
+      security:
+        - apikey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200": { description: Reset email sent (if the account exists) }
+
+  # ----------------------------------------------------------------- Engine RPC
+  /rest/v1/rpc/generate_daily_cards:
+    post:
+      tags: [Engine]
+      summary: Generate (or fetch) today's daily cards
+      description: >-
+        Returns up to 5 personalised cards and persists them for the day.
+        Idempotent per calendar day. `p_mood`/`p_need` are slugs and optional.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                p_mood: { type: string, nullable: true, example: anxious }
+                p_need: { type: string, nullable: true, example: comfort }
+                p_limit: { type: integer, default: 5, minimum: 1, maximum: 5 }
+                p_exclude_days: { type: integer, default: 30 }
+      responses:
+        "200":
+          description: Card items (one row per card)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CardItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /rest/v1/rpc/update_user_streak:
+    post:
+      tags: [Engine]
+      summary: Mark today's session complete & update streak
+      description: One session/day. Consecutive day +1; skipped day resets to 1.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Streak state
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/StreakResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # ------------------------------------------------------------- Edge Functions
+  /functions/v1/generate-daily-cards:
+    post:
+      tags: [Edge Functions]
+      summary: Generate daily cards (HTTP wrapper)
+      description: >-
+        Resolves the user from the JWT (ignores/validates body `userId`) and
+        calls `generate_daily_cards`. Returns a shaped card object.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId: { type: string, format: uuid, nullable: true }
+                mood: { type: string, example: anxious }
+                need: { type: string, example: comfort }
+      responses:
+        "200":
+          description: Daily card set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DailyCardResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: body userId does not match the authenticated user }
+
+  /functions/v1/update-user-streak:
+    post:
+      tags: [Edge Functions]
+      summary: Update streak (HTTP wrapper)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Streak state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  userId: { type: string, format: uuid }
+                  streakCount: { type: integer, example: 4 }
+                  lastSessionDate: { type: string, format: date }
+                  incremented: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # -------------------------------------------------------------------- Content
+  /rest/v1/scriptures:
+    get:
+      tags: [Content]
+      summary: List / filter scriptures
+      description: "Public read. Use PostgREST filters, e.g. `?theme=eq.hope&limit=10`."
+      parameters:
+        - { in: query, name: select, schema: { type: string }, example: "reference,text,theme" }
+        - { in: query, name: theme, schema: { type: string }, example: "eq.hope" }
+        - { in: query, name: limit, schema: { type: integer }, example: 10 }
+      responses:
+        "200":
+          description: Scriptures
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Scripture" }
+
+  /rest/v1/moods:
+    get:
+      tags: [Content]
+      summary: List moods (slug + name)
+      responses:
+        "200": { description: Moods, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Lookup" } } } } }
+
+  /rest/v1/needs:
+    get:
+      tags: [Content]
+      summary: List needs (slug + name)
+      responses:
+        "200": { description: Needs, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Lookup" } } } } }
+
+  # ------------------------------------------------------------------ User Data
+  /rest/v1/profiles:
+    get:
+      tags: [User Data]
+      summary: Get own profile (RLS)
+      parameters:
+        - { in: query, name: select, schema: { type: string }, example: "*" }
+      responses:
+        "200": { description: Profile, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Profile" } } } } }
+    patch:
+      tags: [User Data]
+      summary: Update own profile (e.g. personality_type, full_name)
+      parameters:
+        - { in: query, name: id, schema: { type: string }, example: "eq.<user-uuid>" }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                full_name: { type: string }
+                personality_type:
+                  type: string
+                  enum: [contemplative, activist, scholar, encourager, worshipper]
+      responses:
+        "204": { description: Updated }
+
+  /rest/v1/daily_cards:
+    get:
+      tags: [User Data]
+      summary: Read own daily cards (embed items + verses)
+      parameters:
+        - in: query
+          name: select
+          schema: { type: string }
+          example: "id,date,daily_card_items(position,scriptures(reference,text,theme))"
+        - { in: query, name: date, schema: { type: string }, example: "eq.2026-06-10" }
+      responses:
+        "200": { description: Daily cards }
+
+  /rest/v1/favorites:
+    get:
+      tags: [User Data]
+      summary: List own favourites
+      responses:
+        "200": { description: Favorites }
+    post:
+      tags: [User Data]
+      summary: Add a favourite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, scripture_id]
+              properties:
+                user_id: { type: string, format: uuid }
+                scripture_id: { type: string, format: uuid }
+      responses:
+        "201": { description: Created }
+
+  /rest/v1/reflections:
+    post:
+      tags: [User Data]
+      summary: Save a reflection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, scripture_id, note]
+              properties:
+                user_id: { type: string, format: uuid }
+                scripture_id: { type: string, format: uuid }
+                note: { type: string }
+      responses:
+        "201": { description: Created }
+
+  /rest/v1/user_scripture_history:
+    post:
+      tags: [User Data]
+      summary: Record that a scripture was viewed (feeds the recommender)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, scripture_id]
+              properties:
+                user_id: { type: string, format: uuid }
+                scripture_id: { type: string, format: uuid }
+      responses:
+        "201": { description: Created }
+
+  /rest/v1/notification_preferences:
+    get:
+      tags: [User Data]
+      summary: Read own notification preferences
+      responses:
+        "200": { description: Preferences }
+    patch:
+      tags: [User Data]
+      summary: Update notification preferences
+      parameters:
+        - { in: query, name: user_id, schema: { type: string }, example: "eq.<user-uuid>" }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                reminder_time: { type: string, example: "07:30" }
+                timezone: { type: string, example: "Africa/Lagos" }
+      responses:
+        "204": { description: Updated }
+
+components:
+  securitySchemes:
+    apikey:
+      type: apiKey
+      in: header
+      name: apikey
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    Unauthorized:
+      description: Missing/invalid apikey or access token
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+  schemas:
+    Lookup:
+      type: object
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+    Scripture:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        reference: { type: string, example: "John 3:16" }
+        text: { type: string }
+        theme: { type: string, nullable: true }
+        reflection_question: { type: string, nullable: true }
+        translation: { type: string, example: KJV }
+    Profile:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, nullable: true }
+        full_name: { type: string, nullable: true }
+        personality_type: { type: string, nullable: true }
+        streak_count: { type: integer }
+        total_cards_viewed: { type: integer }
+        total_reflections: { type: integer }
+        created_at: { type: string, format: date-time }
+    CardItem:
+      type: object
+      properties:
+        daily_card_id: { type: string, format: uuid }
+        card_date: { type: string, format: date }
+        card_position: { type: integer, example: 1 }
+        scripture_id: { type: string, format: uuid }
+        verse_reference: { type: string, example: "Philippians 4:6" }
+        verse_text: { type: string }
+        theme: { type: string, nullable: true }
+        reflection_question: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+    StreakResult:
+      type: object
+      properties:
+        streak_count: { type: integer, example: 4 }
+        last_session_date: { type: string, format: date }
+        incremented: { type: boolean }
+    AuthSession:
+      type: object
+      properties:
+        access_token: { type: string, description: JWT — use as the Bearer token }
+        token_type: { type: string, example: bearer }
+        expires_in: { type: integer, example: 3600 }
+        refresh_token: { type: string }
+        user:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string }
+            role: { type: string, example: authenticated }
+    DailyCardResponse:
+      type: object
+      properties:
+        userId: { type: string, format: uuid }
+        dailyCardId: { type: string, format: uuid, nullable: true }
+        date: { type: string, format: date, nullable: true }
+        count: { type: integer, example: 5 }
+        cards:
+          type: array
+          items:
+            type: object
+            properties:
+              position: { type: integer }
+              scriptureId: { type: string, format: uuid }
+              reference: { type: string }
+              text: { type: string }
+              theme: { type: string, nullable: true }
+              reflectionQuestion: { type: string, nullable: true }
+              category: { type: string, nullable: true }

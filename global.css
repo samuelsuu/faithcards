@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-ink: 31 34 51; /* #1f2233 */
+    --color-ink-muted: 107 114 128; /* #6b7280 */
+    --color-ink-soft: 156 163 175; /* #9ca3af */
+    --color-surface: 255 255 255; /* white */
+    --color-surface-soft: 251 247 240; /* sand-50 */
+    --color-line: 224 231 255; /* brand-100 */
+  }
+
+  .dark:root {
+    --color-ink: 237 238 245; /* near-white */
+    --color-ink-muted: 156 163 184; /* slate */
+    --color-ink-soft: 110 117 138;
+    --color-surface: 30 33 51; /* deep indigo slate */
+    --color-surface-soft: 41 44 64;
+    --color-line: 55 58 86;
+  }
+}
