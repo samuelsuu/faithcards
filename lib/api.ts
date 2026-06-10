@@ -129,6 +129,40 @@ export async function fetchScriptures(limit = 150): Promise<Scripture[]> {
   return unwrap<Scripture[]>(data, error);
 }
 
+export interface ScripturePage {
+  items: Scripture[];
+  /** Next offset to request, or null when there are no more rows. */
+  nextOffset: number | null;
+}
+
+/**
+ * One page of scriptures for the infinite Verses feed. Search & theme filter
+ * run server-side (the table has 30k+ rows, so client-side filtering of a
+ * partial list would be misleading).
+ */
+export async function fetchScripturesPage(params: {
+  offset: number;
+  limit: number;
+  search?: string;
+  theme?: string | null;
+}): Promise<ScripturePage> {
+  const { offset, limit, search, theme } = params;
+  let q = supabase
+    .from("scriptures")
+    .select("id,reference,text,theme,reflection_question,translation");
+
+  if (theme) q = q.eq("theme", theme);
+
+  const term = search?.trim().replace(/[(),*%]/g, " ").trim();
+  if (term) {
+    q = q.or(`text.ilike.%${term}%,reference.ilike.%${term}%`);
+  }
+
+  const { data, error } = await q.order("id").range(offset, offset + limit - 1);
+  const items = unwrap<Scripture[]>(data, error);
+  return { items, nextOffset: items.length < limit ? null : offset + limit };
+}
+
 export async function fetchScripture(id: string): Promise<Scripture | null> {
   const { data, error } = await supabase
     .from("scriptures")
